@@ -1,0 +1,173 @@
+package cl.posgo.apiproxyandroid.routes
+
+import android.content.Context
+import cl.posgo.apiproxyandroid.services.LoggerService
+import cl.posgo.apiproxyandroid.utils.HttpClient
+import cl.posgo.apiproxyandroid.utils.Extensions.getBodyAsMap
+import com.google.gson.Gson
+import fi.iki.elonen.NanoHTTPD
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+
+class PosSessionRoutes(
+    private val context: Context,
+    private val logger: LoggerService
+) {
+    private val client = HttpClient.createUnsafeClient()
+    private val gson = Gson()
+    private val sessionsCache = mutableMapOf<String, Pair<Map<String, Any>, Long>>()
+    private val sessionCacheTTL = 60 * 60 * 1000L
+
+    fun handle(
+        uri: String,
+        method: NanoHTTPD.Method,
+        session: NanoHTTPD.IHTTPSession,
+        odooUrl: String
+    ): NanoHTTPD.Response {
+        return when {
+            uri == "/api/pos/sessions/validate" && method == NanoHTTPD.Method.POST ->
+                validateSession(session, odooUrl)
+            uri == "/api/pos/sessions/close" && method == NanoHTTPD.Method.POST ->
+                closeSession(session, odooUrl)
+            uri == "/api/pos/sessions/status" && method == NanoHTTPD.Method.GET ->
+                getSessionsStatus()
+            uri == "/api/pos/sessions/clear-cache" && method == NanoHTTPD.Method.POST ->
+                clearCache()
+            else -> NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.NOT_FOUND,
+                "application/json",
+                gson.toJson(mapOf("error" to "Not found"))
+            )
+        }
+    }
+
+    private fun validateSession(session: NanoHTTPD.IHTTPSession, odooUrl: String): NanoHTTPD.Response {
+        return try {
+            val body = session.getBodyAsMap()
+            val pin = body["pin"]?.toString() ?: ""
+
+            if (pin.isEmpty()) {
+                return NanoHTTPD.newFixedLengthResponse(
+                    NanoHTTPD.Response.Status.BAD_REQUEST,
+                    "application/json",
+                    gson.toJson(mapOf("success" to false, "error" to "PIN requerido"))
+                )
+            }
+
+            val cached = sessionsCache[pin]
+            if (cached != null && (System.currentTimeMillis() - cached.second) < sessionCacheTTL) {
+                logger.info("Sesión encontrada en cache")
+                return NanoHTTPD.newFixedLengthResponse(
+                    NanoHTTPD.Response.Status.OK,
+                    "application/json",
+                    gson.toJson(mapOf(
+                        "success" to true,
+                        "data" to cached.first,
+                        "source" to "cache"
+                    ))
+                )
+            }
+
+            val requestBody = gson.toJson(body).toRequestBody("application/json".toMediaType())
+            val request = Request.Builder()
+                .url("$odooUrl/pos_validate_session")
+                .post(requestBody)
+                .build()
+
+            val response = client.newCall(request).execute()
+            val responseData = response.body?.string() ?: "{}"
+            val sessionData = gson.fromJson(responseData, Map::class.java) as Map<String, Any>
+
+            if (sessionData["authenticated"] == true) {
+                sessionsCache[pin] = Pair(sessionData, System.currentTimeMillis())
+                logger.success("Sesión validada y cacheada")
+            }
+
+            NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.OK,
+                "application/json",
+                gson.toJson(mapOf(
+                    "success" to true,
+                    "data" to sessionData,
+                    "source" to "odoo"
+                ))
+            )
+        } catch (e: Exception) {
+            logger.error("Error validando sesión: ${e.message}")
+            NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.INTERNAL_ERROR,
+                "application/json",
+                gson.toJson(mapOf("success" to false, "error" to e.message))
+            )
+        }
+    }
+
+    private fun closeSession(session: NanoHTTPD.IHTTPSession, odooUrl: String): NanoHTTPD.Response {
+        return try {
+            val body = session.getBodyAsMap()
+
+            val requestBody = gson.toJson(body).toRequestBody("application/json".toMediaType())
+            val request = Request.Builder()
+                .url("$odooUrl/pos_close_session")
+                .post(requestBody)
+                .build()
+
+            val response = client.newCall(request).execute()
+            val responseData = response.body?.string() ?: "{}"
+
+            sessionsCache.clear()
+            logger.info("Cache de sesiones limpiado tras cierre")
+
+            NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.OK,
+                "application/json",
+                responseData
+            )
+        } catch (e: Exception) {
+            logger.error("Error cerrando sesión: ${e.message}")
+            NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.INTERNAL_ERROR,
+                "application/json",
+                gson.toJson(mapOf("success" to false, "error" to e.message))
+            )
+        }
+    }
+
+    private fun getSessionsStatus(): NanoHTTPD.Response {
+        val sessions = sessionsCache.map { (pin, data) ->
+            val ageMinutes = (System.currentTimeMillis() - data.second) / 1000 / 60
+            val remainingMinutes = (sessionCacheTTL - (System.currentTimeMillis() - data.second)) / 1000 / 60
+
+            mapOf(
+                "pin_masked" to "*".repeat(pin.length),
+                "age_minutes" to ageMinutes,
+                "remaining_minutes" to maxOf(0, remainingMinutes)
+            )
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(
+            NanoHTTPD.Response.Status.OK,
+            "application/json",
+            gson.toJson(mapOf(
+                "total_cached_sessions" to sessionsCache.size,
+                "sessions" to sessions
+            ))
+        )
+    }
+
+    private fun clearCache(): NanoHTTPD.Response {
+        val count = sessionsCache.size
+        sessionsCache.clear()
+        logger.info("Cache de sesiones limpiado manualmente ($count sesiones)")
+
+        return NanoHTTPD.newFixedLengthResponse(
+            NanoHTTPD.Response.Status.OK,
+            "application/json",
+            gson.toJson(mapOf(
+                "success" to true,
+                "sessions_removed" to count
+            ))
+        )
+    }
+}
