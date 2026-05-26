@@ -38,6 +38,8 @@ class ApiService : Service() {
             val intent = Intent(context, ApiService::class.java)
             context.stopService(intent)
         }
+
+        fun getLogger() = ApiServer.instance?.logger
     }
 
     override fun onCreate() {
@@ -69,6 +71,9 @@ class ApiService : Service() {
 
     private suspend fun initializeService() {
         try {
+            apiServer?.stopServer()
+            apiServer = null
+
             updateNotification("Iniciando servidor...")
 
             delay(500)

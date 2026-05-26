@@ -3,6 +3,7 @@ package cl.posgo.apiproxyandroid
 import android.content.Context
 import cl.posgo.apiproxyandroid.database.DatabaseManager
 import cl.posgo.apiproxyandroid.routes.*
+import cl.posgo.apiproxyandroid.utils.Extensions.getBodyAsMap
 import cl.posgo.apiproxyandroid.services.BackgroundProcessor
 import cl.posgo.apiproxyandroid.services.LoggerService
 import com.google.gson.Gson
@@ -15,9 +16,14 @@ class ApiServer(
     private val port: Int = 9000
 ) : NanoHTTPD(port) {
 
+    companion object {
+        var instance: ApiServer? = null
+            private set
+    }
+
     private val gson = Gson()
     private val database = DatabaseManager.getInstance(context)
-    private val logger = LoggerService(context)
+    val logger = LoggerService(context)
     private val backgroundProcessor = BackgroundProcessor(context, database, logger)
 
     private val autoservicioRoutes = AutoservicioRoutes(context, database, logger)
@@ -30,6 +36,7 @@ class ApiServer(
     private val syncStatusRoutes = SyncStatusRoutes(context, database, logger)
     private val transactionsRoutes = TransactionsRoutes(context, database, logger)
     private val combosRoutes = CombosRoutes(context)
+    private val promotionsRoutes = PromotionsRoutes(logger)
 
     private var odooUrl = ""
     private var xsignUrl = ""
@@ -39,6 +46,7 @@ class ApiServer(
     init {
         ConfigManager.initialize(context)
         loadConfig()
+        instance = this
     }
 
     private fun loadConfig() {
@@ -100,6 +108,11 @@ class ApiServer(
                 syncStatusRoutes.handle(uri, method, session)
             uri.startsWith("/api/transactions") ->
                 transactionsRoutes.handle(uri, method, session)
+            uri.startsWith("/api/promotions") ->
+                promotionsRoutes.handle(uri, method, session, odooUrl)
+
+            uri == "/api/config" && method == Method.GET -> handleGetConfig()
+            uri == "/api/config" && method == Method.POST -> handlePostConfig(session)
 
             uri == "/api/combos/list" && method == Method.GET ->
                 combosRoutes.handleGetCombosList(session)
@@ -108,6 +121,10 @@ class ApiServer(
             uri.matches(Regex("/api/combos/\\d+")) && method == Method.GET -> {
                 val comboId = uri.removePrefix("/api/combos/")
                 combosRoutes.handleGetComboDetail(session, comboId)
+            }
+            uri.matches(Regex("/api/products/\\d+/combo-groups")) && method == Method.GET -> {
+                val productId = uri.split("/")[3]
+                combosRoutes.handleGetProductComboGroups(session, productId)
             }
             uri.matches(Regex("/api/products/\\d+/suggestions")) && method == Method.GET -> {
                 val productId = uri.split("/")[3]
@@ -128,6 +145,66 @@ class ApiServer(
                 gson.toJson(mapOf("error" to "Endpoint not found"))
             )
         })
+    }
+
+    private fun handleGetConfig(): Response {
+        val config = ConfigManager.getConfig()
+        val localPin = config.posPin
+        return newFixedLengthResponse(
+            Response.Status.OK,
+            "application/json",
+            gson.toJson(mapOf(
+                "ODOO_URL" to config.odooUrl,
+                "XSIGN_URL" to config.xsignUrl,
+                "KDS_URL" to config.kdsUrl,
+                "PRINTER_TICKET_NAME" to config.printerName,
+                "N8N_WEBHOOK_URL" to config.n8nWebhookUrl,
+                "MP_URL" to config.mpUrl,
+                "POS_PIN" to if (localPin.isNotEmpty()) "*".repeat(localPin.length) else ""
+            ))
+        )
+    }
+
+    private fun handlePostConfig(session: IHTTPSession): Response {
+        return try {
+            @Suppress("UNCHECKED_CAST")
+            val bodyMap = session.getBodyAsMap() as? Map<String, Any> ?: emptyMap()
+            val allowed = setOf("ODOO_URL", "XSIGN_URL", "KDS_URL", "PRINTER_TICKET_NAME", "N8N_WEBHOOK_URL", "MP_URL", "POS_PIN")
+            val updates = bodyMap.filterKeys { it in allowed }.mapValues { it.value.toString() }
+
+            if (updates.isEmpty()) {
+                return newFixedLengthResponse(
+                    Response.Status.BAD_REQUEST,
+                    "application/json",
+                    gson.toJson(mapOf("success" to false, "error" to "No se enviaron campos válidos"))
+                )
+            }
+
+            ConfigManager.updateConfig(
+                odooUrl = updates["ODOO_URL"],
+                xsignUrl = updates["XSIGN_URL"],
+                kdsUrl = updates["KDS_URL"],
+                printerName = updates["PRINTER_TICKET_NAME"],
+                n8nWebhookUrl = updates["N8N_WEBHOOK_URL"],
+                mpUrl = updates["MP_URL"],
+                posPin = updates["POS_PIN"]
+            )
+            loadConfig()
+            logger.success("Configuración actualizada: ${updates.keys.joinToString()}")
+
+            newFixedLengthResponse(
+                Response.Status.OK,
+                "application/json",
+                gson.toJson(mapOf("success" to true, "updated" to updates.keys.toList()))
+            )
+        } catch (e: Exception) {
+            logger.error("Error actualizando config: ${e.message}")
+            newFixedLengthResponse(
+                Response.Status.INTERNAL_ERROR,
+                "application/json",
+                gson.toJson(mapOf("success" to false, "error" to e.message))
+            )
+        }
     }
 
     private fun handleRoot(): Response {
@@ -168,10 +245,15 @@ class ApiServer(
                 "POST /images/cache/categories/:categoryId",
                 "GET /api/combos/list?session_id={id}",
                 "GET /api/combos/{id}",
+                "GET /api/products/{id}/combo-groups",
                 "GET /api/products/{id}/suggestions",
                 "GET /api/products/{id}/banner",
                 "POST /api/products/{id}/banner",
                 "POST /api/combos/refresh",
+                "GET /api/promotions?pos_config_id={id}",
+                "GET /api/promotions/refresh?pos_config_id={id}",
+                "GET /api/config",
+                "POST /api/config",
                 "GET /health"
             )
         )

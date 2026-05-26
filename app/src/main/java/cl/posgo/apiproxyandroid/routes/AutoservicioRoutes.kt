@@ -1,6 +1,7 @@
 package cl.posgo.apiproxyandroid.routes
 
 import android.content.Context
+import android.util.Log
 import cl.posgo.apiproxyandroid.database.DatabaseManager
 import cl.posgo.apiproxyandroid.services.LoggerService
 import cl.posgo.apiproxyandroid.utils.Extensions.getBodyAsMap
@@ -14,6 +15,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.text.Normalizer
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.math.round
@@ -117,8 +119,8 @@ class AutoservicioRoutes(
 
                 if (!intentId.isNullOrEmpty()) {
                     logger.info("═══════════════════════════════════════════════════════════")
-                    logger.info(" PAGO PRE-AUTORIZADO POR FRONTEND (intent: $intentId)")
-                    logger.info(" Saltando cobro MP - Generando DTE directamente")
+                    logger.info(" PAGO APROBADO POR MP EN FRONTEND (intent: $intentId)")
+                    logger.info(" Cobro ya procesado por MP — Generando DTE directamente")
                     logger.info("═══════════════════════════════════════════════════════════")
                 } else {
                     logger.info("═══════════════════════════════════════════════════════════")
@@ -173,15 +175,24 @@ class AutoservicioRoutes(
                 logger.success("═══════════════════════════════════════════════════════════")
             }
 
+            val orderNumber = orderResult["orderNumber"]?.toString() ?: ""
+            val transactionId = orderResult["transactionId"]?.toString() ?: ""
+
+            // Enviar al KDS (fire-and-forget real — en thread separado para no bloquear la respuesta)
+            Thread { sendToKDS(kdsUrl, bodyMap, orderNumber, transactionId) }.start()
+
+            val dteTed = if (!isVoucher) dteResponse?.get("ted") as? String else null
+
             newJsonResponse(
                 NanoHTTPD.Response.Status.OK,
                 mapOf(
                     "success" to true,
-                    "transaction_id" to orderResult["transactionId"],
-                    "order_number" to orderResult["orderNumber"],
+                    "transaction_id" to transactionId,
+                    "order_number" to orderNumber,
                     "terminal_letter" to orderResult["letter"],
                     "sequence_number" to orderResult["sequenceNumber"],
                     "dte_folio" to if (isVoucher) voucherNumber else (dteResponse?.get("folio") ?: 0),
+                    "dte_ted" to (dteTed ?: ""),
                     "is_internal_voucher" to isVoucher,
                     "internal_voucher_number" to (voucherNumber ?: ""),
                     "message" to if (isVoucher) "Vale interno procesado correctamente" else "Orden procesada correctamente"
@@ -280,6 +291,78 @@ class AutoservicioRoutes(
     }
 
     @Suppress("UNCHECKED_CAST")
+    private fun sendToKDS(kdsUrl: String, bodyMap: Map<*, *>, orderNumber: String, transactionId: String) {
+        logger.info("[KDS] ── Iniciando envío al KDS ──")
+        if (kdsUrl.isBlank()) {
+            logger.warn("[KDS] KDS_URL vacía — omitiendo envío")
+            return
+        }
+        logger.info("[KDS] URL destino: $kdsUrl/api/kds/new-order")
+        try {
+            val orders = bodyMap["orders"] as? List<*> ?: emptyList<Any>()
+            val firstOrder = orders.firstOrNull() as? Map<*, *> ?: emptyMap<Any?, Any?>()
+            val products = firstOrder["products"] as? List<*> ?: emptyList<Any>()
+
+            logger.info("[KDS] Productos en la orden: ${products.size}")
+
+            val kdsItems = products.map { p ->
+                val prod = p as? Map<*, *> ?: emptyMap<Any?, Any?>()
+                val name = prod["name"] ?: ""
+                val qty = (prod["qty"] as? Number)?.toInt() ?: 1
+                val catId = (prod["category_id"] as? Number)?.toInt()
+                val catName = prod["category_name"] as? String ?: ""
+                mapOf(
+                    "name" to name,
+                    "cant" to qty,
+                    "notes" to (prod["customization"] ?: ""),
+                    "category_id" to catId,
+                    "category_name" to catName,
+                    "attribute_lines" to (prod["attribute_lines"] ?: emptyList<Any>())
+                )
+            }
+
+            val customerComment = firstOrder["customer_comment"] as? String ?: ""
+
+            val kdsPayload = gson.toJson(mapOf(
+                "external_id" to transactionId,
+                "order_number" to orderNumber,
+                "items" to kdsItems,
+                "source" to "autoservicio",
+                "customer_name" to "Cliente",
+                "note" to customerComment
+            ))
+
+            logger.info("[KDS] Payload listo (${kdsPayload.length} bytes) — enviando request...")
+
+            val request = Request.Builder()
+                .url("$kdsUrl/api/kds/new-order")
+                .post(kdsPayload.toRequestBody("application/json".toMediaType()))
+                .addHeader("Content-Type", "application/json")
+                .build()
+
+            val response = client.newCall(request).execute()
+            val responseBody = response.body?.string() ?: "{}"
+
+            if (response.isSuccessful) {
+                logger.success("[KDS] ✓ Orden $orderNumber enviada — respuesta ${response.code}: $responseBody")
+                Log.i("KDS", "Orden $orderNumber enviada al KDS ($kdsUrl) - respuesta: $responseBody")
+            } else {
+                logger.warn("[KDS] ✗ KDS respondió ${response.code}: $responseBody")
+                Log.w("KDS", "KDS error ${response.code}: $responseBody")
+            }
+        } catch (e: java.net.ConnectException) {
+            logger.error("[KDS] ✗ No se pudo conectar a $kdsUrl — ¿está el KDS encendido? (${e.message})")
+            Log.e("KDS", "ConnectException: ${e.message}", e)
+        } catch (e: java.net.SocketTimeoutException) {
+            logger.error("[KDS] ✗ Timeout conectando a $kdsUrl (${e.message})")
+            Log.e("KDS", "SocketTimeoutException: ${e.message}", e)
+        } catch (e: Exception) {
+            logger.error("[KDS] ✗ Error inesperado: ${e.javaClass.simpleName} — ${e.message}")
+            Log.e("KDS", "Error enviando al KDS: ${e.message}", e)
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
     private suspend fun generateDTE(
         bodyMap: Map<*, *>,
         xsignUrl: String
@@ -299,15 +382,18 @@ class AutoservicioRoutes(
                 .addHeader("Accept", "*/*")
                 .build()
 
-            logger.info("Generando DTE en XSign...")
+            logger.info("[DTE] Enviando a XSign URL: $url")
+            logger.info("[DTE] Payload completo:\n${gson.toJson(dteData)}")
 
             val response = client.newCall(request).execute()
             val responseBody = response.body?.string() ?: "{}"
 
             if (!response.isSuccessful) {
-                logger.error("XSign error: $responseBody")
+                logger.error("[DTE] XSign respondió ${response.code}: $responseBody")
                 return@withContext null
             }
+
+            logger.info("[DTE] XSign OK: $responseBody")
 
             gson.fromJson(responseBody, Map::class.java) as Map<String, Any>
 
@@ -316,6 +402,30 @@ class AutoservicioRoutes(
             null
         }
     }
+
+    private fun String.escapeXml(): String = this
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&apos;")
+        .replace("\n", " ")
+        .replace("\r", " ")
+        .replace("\t", " ")
+        .trim()
+
+    // Convierte á→a, ñ→n, etc. antes de limpiar
+    private fun String.normalizeNFD(): String =
+        Normalizer.normalize(this, Normalizer.Form.NFD)
+            .replace(Regex("\\p{InCombiningDiacriticalMarks}"), "")
+
+    // Limpia para SII: normaliza acentos, elimina no-ASCII, trunca y escapa XML
+    private fun String.sanitizeForSII(maxLen: Int = 80): String = this
+        .normalizeNFD()
+        .replace(Regex("[^\\x20-\\x7E]"), " ")
+        .trim()
+        .take(maxLen)
+        .escapeXml()
 
     private fun buildDTEData(
         bodyMap: Map<*, *>,
@@ -330,9 +440,10 @@ class AutoservicioRoutes(
             (p["price_subtotal"] as? Number)?.toDouble() ?: 0.0
         }
 
-        val mntNeto = round(totalAmount / 1.19).toInt()
-        val iva = round(totalAmount - mntNeto).toInt()
-        val mntTotal = round(totalAmount).toInt()
+        val dscRcgGlobalAmount = ((firstOrder["dsc_rcg_global"] as? Number)?.toDouble() ?: 0.0)
+        val mntTotal = round(totalAmount - dscRcgGlobalAmount).toInt()
+        val mntNeto = round(mntTotal / 1.19).toInt()
+        val iva = mntTotal - mntNeto
 
         val companyData = sessionData["company_data"] as? Map<*, *>
 
@@ -351,11 +462,24 @@ class AutoservicioRoutes(
                 "VlrCodigo" to productId.toString()
             )
 
+            val rawName = p["name"] as? String ?: "Producto ${index + 1}"
+            val rawCustomization = p["customization"] as? String ?: "N/A"
+            val sanitizedName = rawName.sanitizeForSII(70)
+            val sanitizedDesc = rawCustomization.sanitizeForSII(1000)
+
+            logger.info("[DTE] Producto ${index + 1}: '$rawName' → '$sanitizedName'")
+            if (rawName != sanitizedName) {
+                logger.info("[DTE]   ⚠ Nombre modificado por sanitización")
+            }
+            if (rawCustomization.length > 1000) {
+                logger.info("[DTE]   ⚠ Descripción truncada de ${rawCustomization.length} a 1000 chars")
+            }
+
             hashMapOf<String, Any>(
                 "NroLinDet" to (index + 1),
                 "CdgItem" to cdgItem,
-                "NmbItem" to (p["name"] ?: "Producto ${index + 1}"),
-                "DscItem" to (p["customization"] ?: "N/A"),
+                "NmbItem" to sanitizedName,
+                "DscItem" to sanitizedDesc,
                 "QtyItem" to qty,
                 "PrcItem" to unitPrice,
                 "MontoItem" to round(priceSubtotal).toInt()
@@ -369,11 +493,11 @@ class AutoservicioRoutes(
 
         val emisor = hashMapOf<String, Any>(
             "RUTEmisor" to (companyData?.get("vat") ?: "76.000.000-0"),
-            "RznSoc" to (companyData?.get("name") ?: "AUTOSERVICIO"),
-            "GiroEmis" to (companyData?.get("turn") ?: "COMERCIO"),
+            "RznSoc" to (companyData?.get("name") as? String ?: "AUTOSERVICIO").escapeXml(),
+            "GiroEmis" to (companyData?.get("turn") as? String ?: "COMERCIO").escapeXml(),
             "Acteco" to (companyData?.get("acteco") ?: "471100"),
-            "DirOrigen" to (companyData?.get("street") ?: "N/A"),
-            "CmnaOrigen" to (companyData?.get("city") ?: "N/A"),
+            "DirOrigen" to (companyData?.get("street") as? String ?: "N/A").escapeXml(),
+            "CmnaOrigen" to (companyData?.get("city") as? String ?: "N/A").escapeXml(),
             "CdgVendedor" to "autoservicio"
         )
 
@@ -388,7 +512,7 @@ class AutoservicioRoutes(
             "MntNeto" to mntNeto,
             "IVA" to iva,
             "MntTotal" to mntTotal
-        )
+        ).also { if (dscRcgGlobalAmount > 0) it["MntDesc"] = round(dscRcgGlobalAmount).toInt() }
 
         val encabezado = hashMapOf<String, Any>(
             "IdDoc" to idDoc,
@@ -397,8 +521,13 @@ class AutoservicioRoutes(
             "Totales" to totales
         )
 
+        val paymentMethodType = (firstOrder["payment"] as? List<*>)
+            ?.firstOrNull()?.let { (it as? Map<*, *>)?.get("payment_method_type") as? String } ?: ""
+        val paymentDesc = if (paymentMethodType.contains("debit", ignoreCase = true)) "DEBITO" else "CREDITO"
+        logger.info("[DTE] payment_method_type recibido: '$paymentMethodType' → desc: '$paymentDesc'")
+
         val pagoItem = hashMapOf<String, Any>(
-            "desc" to "CREDITO",
+            "desc" to paymentDesc,
             "monto" to mntTotal
         )
 
@@ -414,7 +543,14 @@ class AutoservicioRoutes(
             "Encabezado" to encabezado,
             "infoPagos" to infoPagos,
             "Detalle" to detalleItems,
-            "DscRcgGlobal" to emptyList<Any>(),
+            "DscRcgGlobal" to if (dscRcgGlobalAmount > 0) listOf(
+                hashMapOf<String, Any>(
+                    "NroLinDR" to 1,
+                    "TpoMov" to "D",
+                    "TpoValor" to "$",
+                    "ValorDR" to round(dscRcgGlobalAmount).toInt()
+                )
+            ) else emptyList<Any>(),
             "session_id" to ((bodyMap["session_id"] as? Number)?.toInt() ?: 0)
         )
     }

@@ -15,9 +15,19 @@ android {
         versionName = "1.0.0"
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = file("C:/Users/Diego/Escritorio/Trabajo/Autoservicio/AutoservicioGetIT-2.0/getit-release.jks")
+            storePassword = "GetIT2024!"
+            keyAlias = "getit"
+            keyPassword = "GetIT2024!"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

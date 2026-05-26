@@ -34,6 +34,10 @@ class PosSessionRoutes(
                 getSessionsStatus()
             uri == "/api/pos/sessions/clear-cache" && method == NanoHTTPD.Method.POST ->
                 clearCache()
+            uri.startsWith("/api/pos/session-state") && method == NanoHTTPD.Method.GET ->
+                checkSessionState(session, odooUrl)
+            uri == "/api/pos/balanza-rules" && method == NanoHTTPD.Method.GET ->
+                getBalanzaRules(odooUrl)
             else -> NanoHTTPD.newFixedLengthResponse(
                 NanoHTTPD.Response.Status.NOT_FOUND,
                 "application/json",
@@ -134,6 +138,39 @@ class PosSessionRoutes(
         }
     }
 
+    private fun checkSessionState(session: NanoHTTPD.IHTTPSession, odooUrl: String): NanoHTTPD.Response {
+        return try {
+            val params = session.parameters
+            val sessionId = params["session_id"]?.firstOrNull()
+                ?: return NanoHTTPD.newFixedLengthResponse(
+                    NanoHTTPD.Response.Status.BAD_REQUEST,
+                    "application/json",
+                    gson.toJson(mapOf("error" to "Falta session_id"))
+                )
+
+            val request = Request.Builder()
+                .url("$odooUrl/pos_session_state?session_id=$sessionId")
+                .get()
+                .build()
+
+            val response = client.newCall(request).execute()
+            val responseBody = response.body?.string() ?: "{}"
+
+            NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.OK,
+                "application/json",
+                responseBody
+            )
+        } catch (e: Exception) {
+            logger.error("Error verificando estado de sesión: ${e.message}")
+            NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.INTERNAL_ERROR,
+                "application/json",
+                gson.toJson(mapOf("error" to e.message))
+            )
+        }
+    }
+
     private fun getSessionsStatus(): NanoHTTPD.Response {
         val sessions = sessionsCache.map { (pin, data) ->
             val ageMinutes = (System.currentTimeMillis() - data.second) / 1000 / 60
@@ -154,6 +191,25 @@ class PosSessionRoutes(
                 "sessions" to sessions
             ))
         )
+    }
+
+    private fun getBalanzaRules(odooUrl: String): NanoHTTPD.Response {
+        return try {
+            val request = Request.Builder()
+                .url("$odooUrl/pos_balanza_rules")
+                .get()
+                .build()
+            val response = client.newCall(request).execute()
+            val responseBody = response.body?.string() ?: """{"success":true,"rules":[]}"""
+            NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "application/json", responseBody)
+        } catch (e: Exception) {
+            logger.error("Error obteniendo reglas de balanza: ${e.message}")
+            NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.OK,
+                "application/json",
+                """{"success":true,"rules":[]}"""
+            )
+        }
     }
 
     private fun clearCache(): NanoHTTPD.Response {

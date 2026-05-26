@@ -13,6 +13,7 @@ object ConfigManager {
     private const val KEY_PRINTER_NAME = "PRINTER_TICKET_NAME"
     private const val KEY_N8N_WEBHOOK = "N8N_WEBHOOK_URL"
     private const val KEY_MP_URL = "MP_URL"
+    private const val KEY_POS_PIN = "POS_PIN"
 
     private const val DEFAULT_ODOO_URL = "https://getit.posgo.cl"
     private const val DEFAULT_XSIGN_URL = "http://localhost:5999"
@@ -32,7 +33,8 @@ object ConfigManager {
         val kdsUrl: String,
         val printerName: String,
         val n8nWebhookUrl: String,
-        val mpUrl: String
+        val mpUrl: String,
+        val posPin: String
     )
 
     fun getConfig(): Config {
@@ -42,9 +44,12 @@ object ConfigManager {
             kdsUrl = prefs.getString(KEY_KDS_URL, DEFAULT_KDS_URL) ?: DEFAULT_KDS_URL,
             printerName = prefs.getString(KEY_PRINTER_NAME, DEFAULT_PRINTER_NAME) ?: DEFAULT_PRINTER_NAME,
             n8nWebhookUrl = prefs.getString(KEY_N8N_WEBHOOK, "") ?: "",
-            mpUrl = prefs.getString(KEY_MP_URL, DEFAULT_MP_URL) ?: DEFAULT_MP_URL
+            mpUrl = prefs.getString(KEY_MP_URL, DEFAULT_MP_URL) ?: DEFAULT_MP_URL,
+            posPin = prefs.getString(KEY_POS_PIN, "") ?: ""
         )
     }
+
+    fun getPosPin(): String = prefs.getString(KEY_POS_PIN, "") ?: ""
 
     fun updateConfig(
         odooUrl: String? = null,
@@ -52,7 +57,8 @@ object ConfigManager {
         kdsUrl: String? = null,
         printerName: String? = null,
         n8nWebhookUrl: String? = null,
-        mpUrl: String? = null
+        mpUrl: String? = null,
+        posPin: String? = null
     ) {
         prefs.edit().apply {
             odooUrl?.let { putString(KEY_ODOO_URL, it) }
@@ -61,6 +67,7 @@ object ConfigManager {
             printerName?.let { putString(KEY_PRINTER_NAME, it) }
             n8nWebhookUrl?.let { putString(KEY_N8N_WEBHOOK, it) }
             mpUrl?.let { putString(KEY_MP_URL, it) }
+            posPin?.let { putString(KEY_POS_PIN, it) }
             apply()
         }
     }

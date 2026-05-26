@@ -34,6 +34,8 @@ class ImagesRoutes(
                 clearCache()
             uri == "/images/cache/stats" && method == NanoHTTPD.Method.GET ->
                 getCacheStats()
+            uri.startsWith("/images/cache/categories/") && method == NanoHTTPD.Method.DELETE ->
+                deleteCategoryImageCache(uri)
             uri.startsWith("/images/cache/categories/") && method == NanoHTTPD.Method.POST ->
                 cacheCategoryImage(uri, session)
             uri.startsWith("/images/cache/") && method == NanoHTTPD.Method.POST ->
@@ -139,7 +141,7 @@ class ImagesRoutes(
             val cached = database.getCategoryImageFromCache(categoryId)
 
             if (cached != null) {
-                logger.info("Imagen categoría $categoryId servida desde cache")
+                logger.info("CAT_IMG $categoryId: CACHE HIT (${cached.length} chars)")
                 return newJsonResponse(
                     NanoHTTPD.Response.Status.OK,
                     mapOf("success" to true, "image_base64" to cached)
@@ -147,25 +149,27 @@ class ImagesRoutes(
             }
 
             if (odooUrl.isNotEmpty()) {
-                logger.info("Imagen categoría $categoryId no en cache, buscando en Odoo...")
+                val odooImgUrl = "$odooUrl/web/image/product.category/$categoryId/category_image"
+                logger.info("CAT_IMG $categoryId: CACHE MISS → fetching $odooImgUrl")
                 val imageBase64 = fetchCategoryImageFromOdoo(odooUrl, categoryId)
                 if (imageBase64 != null) {
                     database.saveCategoryImageCache(categoryId, imageBase64)
-                    logger.info("Imagen categoría $categoryId obtenida de Odoo y cacheada")
+                    logger.info("CAT_IMG $categoryId: Odoo OK (${imageBase64.length} chars) → cacheado")
                     return newJsonResponse(
                         NanoHTTPD.Response.Status.OK,
                         mapOf("success" to true, "image_base64" to imageBase64)
                     )
                 }
+                logger.warn("CAT_IMG $categoryId: Odoo no devolvió imagen")
             }
 
-            logger.info("Imagen categoría $categoryId no disponible")
+            logger.warn("CAT_IMG $categoryId: NO DISPONIBLE")
             newJsonResponse(
                 NanoHTTPD.Response.Status.NOT_FOUND,
                 mapOf("error" to "Imagen de categoría no disponible")
             )
         } catch (e: Exception) {
-            logger.error("Error sirviendo imagen de categoría: ${e.message}")
+            logger.error("CAT_IMG error: ${e.message}")
             newJsonResponse(
                 NanoHTTPD.Response.Status.INTERNAL_ERROR,
                 mapOf("error" to e.message)
@@ -176,7 +180,7 @@ class ImagesRoutes(
     private fun fetchCategoryImageFromOdoo(odooUrl: String, categoryId: Int): String? {
         return try {
             val request = Request.Builder()
-                .url("$odooUrl/web/image/product.category/$categoryId/totem_image")
+                .url("$odooUrl/web/image/product.category/$categoryId/category_image")
                 .get()
                 .build()
 
@@ -234,6 +238,19 @@ class ImagesRoutes(
                 NanoHTTPD.Response.Status.INTERNAL_ERROR,
                 mapOf("error" to e.message)
             )
+        }
+    }
+
+    private fun deleteCategoryImageCache(uri: String): NanoHTTPD.Response {
+        return try {
+            val categoryId = uri.substringAfterLast("/").toIntOrNull() ?: 0
+            if (categoryId == 0) return newJsonResponse(NanoHTTPD.Response.Status.BAD_REQUEST, mapOf("error" to "Invalid category ID"))
+            database.deleteCategoryImageCache(categoryId)
+            logger.info("CAT_IMG $categoryId: CACHE DELETED")
+            newJsonResponse(NanoHTTPD.Response.Status.OK, mapOf("success" to true))
+        } catch (e: Exception) {
+            logger.error("CAT_IMG delete error: ${e.message}")
+            newJsonResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, mapOf("error" to e.message))
         }
     }
 
